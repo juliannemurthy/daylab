@@ -1,0 +1,39 @@
+cat > .gitignore << 'EOF'
+# Ignore everything at the top level...
+/*
+# ...except these files
+!/.gitignore
+!/README.md
+
+
+!/RNA-Seq/
+/RNA-Seq/*
+!/RNA-Seq/scripts/
+
+!/BETA/
+/BETA/*
+!/BETA/scripts/
+
+!/ChIPseeker/
+/ChIPseeker/*
+!/ChIPseeker/scripts/
+
+!/G4_Peak_Diff_Analysis/
+/G4_Peak_Diff_Analysis/*
+!/G4_Peak_Diff_Analysis/scripts/
+
+*.fastq*
+*.fq*
+*.bam
+*.bai
+*.sam
+*.bw
+*.bigwig
+*.bed.gz
+*.rds
+*.RData
+slurm-*.out
+.snakemake/
+__pycache__/
+.ipynb_checkpoints/
+EOF

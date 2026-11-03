@@ -1,0 +1,17 @@
+# sequencing data & outputs
+*.fastq*
+*.fq*
+*.bam
+*.bai
+*.sam
+*.bw
+*.bigwig
+data/
+results/
+logs/
+.snakemake/
+# environments & clutter
+*.sif
+.ipynb_checkpoints/
+__pycache__/
+slurm-*.out

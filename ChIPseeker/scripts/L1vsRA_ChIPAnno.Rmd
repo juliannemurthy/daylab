@@ -1,0 +1,310 @@
+---
+  title: "L1vsRA ChIPAnno"
+author: "Julianne (Yulia) Murthy and SM"
+date: "2026-05-12"
+---
+ 
+Goal: this script serves to perform ChIPAnno analysis on CUT&Tag data and RNA-Seq data as an alternative to BETA. To see if there is an association between G4 presence/lack thereof and changes in transcription
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+# INSTALL DEPENDENCIES
+```{r}
+if (!require("BiocManager", quietly = TRUE))
+  install.packages("BiocManager")
+BiocManager::install(version = "3.20")
+
+renv::install(c(
+  "YuLab-SMU/GOSemSim",
+  "YuLab-SMU/DOSE",
+  "YuLab-SMU/ggtree",
+  "YuLab-SMU/clusterProfiler",
+  "GuangchuangYu/enrichplot@devel",
+  "bioc::ChIPseeker",
+  "bioc::org.Ce.eg.db",
+  "bioc::TxDb.Celegans.UCSC.ce11.refGene"
+))
+
+renv::install(c("ggplot2", "dplyr"))
+
+renv::install("bioc::txdbmaker")
+
+renv::snapshot()
+```
+
+
+# LOAD LIBRARIES
+```{r}
+library(ChIPseeker)
+library(ChIPpeakAnno)
+library(TxDb.Celegans.UCSC.ce11.refGene)
+library(org.Ce.eg.db)
+library(GenomicFeatures)
+library(RSQLite)
+library(txdbmaker)
+library(ggplot2)
+library(dplyr)
+```
+
+
+# PATHS
+```{r}
+# TxDb for C. elegans 
+txdb <- TxDb.Celegans.UCSC.ce11.refGene
+transcripts(txdb)
+
+# Prep TxDb filter for NM (protein coding) transcripts
+db_conn <- dbconn(txdb)
+
+nm_tx  <- dbReadTable(db_conn, "transcript")
+nm_tx  <- nm_tx[grepl("^NM_", nm_tx$tx_name), ]
+nm_tx <- nm_tx %>% rename(tx_id = X_tx_id)
+nm_ids <- nm_tx$tx_id
+
+splicings_raw <- dbReadTable(db_conn, "splicing") %>% 
+  rename(
+    tx_id   = X_tx_id,
+    exon_id = X_exon_id,
+    cds_id  = X_cds_id
+  )
+genes_raw     <- dbReadTable(db_conn, "gene") %>% rename(tx_id = `X_tx_id`)
+exons_raw <- dbReadTable(db_conn, "exon") %>% rename(exon_id = X_exon_id)
+cds_raw <- dbReadTable(db_conn, "cds") %>% rename(cds_id = X_cds_id)
+
+splicings_full <- splicings_raw %>%
+  left_join(exons_raw[, c("exon_id", "exon_start", "exon_end")], by = "exon_id") %>%
+  left_join(cds_raw[, c("cds_id", "cds_start", "cds_end")],     by = "cds_id")
+
+chrominfo_raw <- dbReadTable(db_conn, "chrominfo")
+chrominfo_raw$is_circular <- as.logical(chrominfo_raw$is_circular)
+
+# Filter TxDb based on NM transcripts (aka protein coding transcripts) using SQL connection
+txdb_nm <- makeTxDb(
+  transcripts = nm_tx,
+  splicings   = splicings_full %>% filter(tx_id %in% nm_ids),
+  genes       = genes_raw     %>% filter(tx_id %in% nm_ids),
+  chrominfo   = chrominfo_raw[, c("chrom", "length", "is_circular")]
+)  
+
+# Annotation source check
+columns(org.Ce.eg.db)
+head(keys(org.Ce.eg.db, keytype = "REFSEQ"), 20)
+
+# BED file locations on hpc
+bed_dir <- "/projects/daylab/yulia/ChIPseeker/chipseeker_infiles/L1vsRA_ChIPseeker"
+
+# Output directory 
+out_dir <- "/projects/daylab/yulia/ChIPseeker/chipseeker_outfiles/L1vsRA_ChIPAnno"
+
+# input filenames - this time using peaks unique to L1 and RA
+file_L1 <- file.path(bed_dir, "L1_HQfinal_unique.bed")
+file_RA <- file.path(bed_dir, "RepAd_HQfinal_unique.bed")
+
+# DESEQ SIGNIFICANT results
+deseq <- read.csv(file.path(bed_dir, "DESeq2_L1vsRA_significant_genes.csv"))
+
+```
+
+
+# READ IN PEAK FILES
+```{r}
+peakL1 <- readPeakFile(file_L1)
+peakRA <- readPeakFile(file_RA)
+
+cat("L1 peaks:  ", length(peakL1), "\n") #2143
+cat("RA peaks:", length(peakRA), "\n") #5923
+```
+
+
+# ANNOTATE PEAKS
+## For C. elegans it appears +/- 3kb is correct, see Hunt-Newbury et al 2007 and Saito et al 2013; longest promoter studied appears to be ~2700bp
+```{r}
+# Extract transcripts and gene feature
+annoData <- toGRanges(txdb_nm, feature = "gene")
+
+# L1 ChipAnno peaks, with flanking genes added as well
+peakAnnoL1 <- annotatePeakInBatch(
+  peakL1,
+  AnnotationData      = annoData,
+  output              = "both",
+  maxgap              = 3000,
+  PeakLocForDistance  = "middle",
+  FeatureLocForDistance = "TSS"   
+)
+
+# RA ChipAnno peaks, with flanking genes added as well
+peakAnnoRA <- annotatePeakInBatch(
+  peakRA,
+  AnnotationData      = annoData,
+  output              = "both",
+  maxgap              = 3000,
+  PeakLocForDistance  = "middle",
+  FeatureLocForDistance = "TSS"
+)
+
+# Add gene symbols with org.Ce.eg.db
+peakAnnoL1 <- addGeneIDs(peakAnnoL1,
+                          orgAnn   = "org.Ce.eg.db",
+                          feature_id_type = "entrez_id",
+                          IDs2Add  = c("symbol","genename"))
+
+peakAnnoRA <- addGeneIDs(peakAnnoRA,
+                          orgAnn   = "org.Ce.eg.db",
+                          feature_id_type = "entrez_id",
+                          IDs2Add  = c("symbol","genename"))
+
+
+
+```
+
+
+# EXPORT FULL ANNOTATION CSVs
+```{r}
+# Convert to data frames
+dfL1 <- as.data.frame(peakAnnoL1)  
+
+dfRA <- as.data.frame(peakAnnoRA)
+
+# Write full annotation CSVs
+write.csv(dfL1, file = file.path(out_dir, "peakAnnoL1_full.csv"),     row.names = FALSE)
+write.csv(dfRA, file = file.path(out_dir, "peakAnnoRA_full.csv"),  row.names = FALSE)
+
+```
+
+# QUICK VISUALIZATION
+```{r}
+# Feature pie plots
+png(file.path(out_dir, "Featureplot_L1vsRA.png"), width = 10, height = 5,
+    units = "in", res = 300)
+par(mfrow = c(1, 2))
+pie1(table(dfL1$insideFeature), main = "L1 Peak Annotation")
+pie1(table(dfRA$insideFeature), main = "RA Peak Annotation")
+dev.off()
+
+# TSS binding distance sites
+png(file.path(out_dir, "distToTSS_L1vsRA.png"), width = 10, height = 5,
+    units = "in", res = 300)
+par(mfrow = c(1, 2))
+hist(dfL1$distancetoFeature, breaks = 50,
+     main = "L1 Distance to TSS", 
+     xlab = "Distance (bp)", 
+     xlim = c(0,100000),
+      ylim = c(0,5000),
+     col = "aquamarine", 
+     border = "white")
+hist(dfRA$distancetoFeature, breaks = 50,
+     main = "RA Distance to TSS", 
+     xlab = "Distance (bp)", 
+     xlim = c(0,100000), 
+     ylim = c(0,5000),
+     col = "coral",    
+     border = "white")
+dev.off()
+
+```
+
+
+# FILTER FOR PROMOTER PEAKS 
+```{r}
+
+# Bin by promoter distance categories
+bin_peaks <- function(df) {
+  df %>%
+    filter(abs(distancetoFeature) <= 3000) %>%
+    mutate(promoter_bin = case_when(
+      abs(distancetoFeature) <= 1000                                  ~ "Promoter (<=1kb)",
+      abs(distancetoFeature) >  1000 & abs(distancetoFeature) <= 2000 ~ "Promoter (1-2kb)",
+      abs(distancetoFeature) >  2000 & abs(distancetoFeature) <= 3000 ~ "Promoter (2-3kb)"
+    ))
+}
+
+promL1 <- bin_peaks(dfL1)
+promRA <- bin_peaks(dfRA)
+
+print(table(promL1$promoter_bin))
+print(table(promRA$promoter_bin))
+cat("L1 promoter peaks:  ", nrow(promL1), "/", nrow(dfL1), "\n") #2181 / 4208
+cat("RA promoter peaks:", nrow(promRA), "/", nrow(dfRA), "\n") #7399 / 12506
+
+```
+
+
+# WRITE THE PROMOTER FILTERED CSVs
+```{r}
+write.csv(promL1, file = file.path(out_dir, "peakAnnoL1_promoter.csv"),    row.names = FALSE)
+write.csv(promRA, file = file.path(out_dir, "peakAnnoRA_promoter.csv"), row.names = FALSE)
+
+```
+
+
+# INNERJOIN SIG DEGs & PROMOTER G4s
+```{r}
+# No header on original deseq file, add in SYMBOL column to join later
+colnames(deseq)[1] <- "SYMBOL"
+
+# Rename symbol column to match deseq
+promL1 <- promL1 %>% rename(SYMBOL = symbol)
+promRA <- promRA %>% rename(SYMBOL = symbol)
+
+# Flag whether the matched gene was nearest TSS or flanking
+promL1 <- promL1 %>%
+  group_by(peak) %>%
+  mutate(association_type = ifelse(abs(distancetoFeature) == min(abs(distancetoFeature)),
+                                   "nearest_TSS", "flanking")) %>%
+  ungroup()
+print(table(promL1$association_type))
+promRA <- promRA %>%
+  group_by(peak) %>%
+  mutate(association_type = ifelse(abs(distancetoFeature) == min(abs(distancetoFeature)),
+                                   "nearest_TSS", "flanking")) %>%
+  ungroup()
+print(table(promRA$association_type))
+
+# Use inner_join() function to match G4 peaks within 3kb of the TSS (“promoter” G4s) to differentially expressed gene
+G4_DEG_L1 <- inner_join(promL1, deseq, by = "SYMBOL")
+G4_DEG_RA <- inner_join(promRA, deseq, by = "SYMBOL")
+
+# Check how many genes overlapped
+cat("L1 promoter G4s with DE genes:", nrow(G4_DEG_L1), "\n") #818
+cat("RA promoter G4s with DE genes:", nrow(G4_DEG_RA), "\n")  #3511
+
+# Export to CSV
+write.csv(G4_DEG_L1, file.path(out_dir, "G4_DEG_overlap_L1.csv"), row.names = FALSE)
+write.csv(G4_DEG_RA, file.path(out_dir, "G4_DEG_overlap_RA.csv"), row.names = FALSE)
+
+```
+
+# FURTHER OBSERVATIONS
+```{r}
+# G4 DEG flanking vs nearest TSS proportions
+print(table(G4_DEG_L1$association_type)) #274 flanking , 544 nearest TSS
+print(table(G4_DEG_RA$association_type)) #1407 flanking , 2104 nearest TSS
+
+# Plot what features are prevalent across the peak DEG overlaps
+png(file.path(out_dir, "Featureplot_G4DEG_L1vsRA.png"), width = 10, height = 5,
+    units = "in", res = 300)
+par(mfrow = c(1, 2))
+pie1(table(G4_DEG_L1$insideFeature), main = "L1 G4 DEG Overlap Features")
+pie1(table(G4_DEG_RA$insideFeature), main = "RA G4 DEG Overlap Features")
+dev.off()
+
+# Look at chromosome distributions
+pie1(table(G4_DEG_L1$seqnames), main = "L1 G4 DEG Chromosome Location")
+pie1(table(G4_DEG_RA$seqnames), main = "RA G4 DEG Chromosome Location")
+
+# Of those flanking vs TSS nearest , what features are shown?
+pie1(table(G4_DEG_L1 %>% filter(association_type == "nearest_TSS") %>% pull(insideFeature)),
+     main = "L1 Nearest TSS")
+pie1(table(G4_DEG_L1 %>% filter(association_type == "flanking")    %>% pull(insideFeature)),
+     main = "L1 Flanking")
+pie1(table(G4_DEG_RA %>% filter(association_type == "nearest_TSS") %>% pull(insideFeature)),
+     main = "RA Nearest TSS")
+pie1(table(G4_DEG_RA %>% filter(association_type == "flanking")    %>% pull(insideFeature)),
+     main = "RA Flanking")
+
+
+```
+
+

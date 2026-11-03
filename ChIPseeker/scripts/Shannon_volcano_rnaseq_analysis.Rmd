@@ -1,0 +1,193 @@
+---
+title: "Shannon_volcano_rnaseq_analysis"
+output: html_document
+author: julianne (yulia) murthy
+date: "2026-28-07"
+---
+
+### reusable volcano plot functions to be used for all 3 timepoints
+
+```{r}
+
+library(EnhancedVolcano)
+library(ggplot2)
+library(dplyr)
+
+# PATHS LABEL
+chipseekerpath <- "/projects/daylab/yulia/ChIPseeker/chipseeker_infiles/Shannon_VolcanoPlots"
+outPath <- "/projects/daylab/yulia/ChIPseeker/chipseeker_outfiles/Shannon_VolcanoPlots"
+
+chipseeker.L1 <- read.csv(file.path(chipseekerpath, "G4_DEG_overlap_L1.csv"))
+
+chipseeker.RA <- read.csv(file.path(chipseekerpath, "G4_DEG_overlap_RA.csv"))
+
+# filter padj < 0.05
+chipseeker.L1_sig <- chipseeker.L1[chipseeker.L1$padj < 0.05, ]
+chipseeker.RA_sig <- chipseeker.RA[chipseeker.RA$padj < 0.05, ]
+
+# write out filtered versions to input path
+write.csv(chipseeker.L1_sig, file.path(chipseekerpath, "G4_DEG_overlap_L1_padj.csv"), row.names = FALSE)
+write.csv(chipseeker.RA_sig, file.path(chipseekerpath, "G4_DEG_overlap_RA_padj.csv"), row.names = FALSE)
+
+promoter_genes.L1 <- unique(na.omit(chipseeker.L1_sig$SYMBOL))
+promoter_genes.RA <- unique(na.omit(chipseeker.RA_sig$SYMBOL))
+
+# genes of interest to label in plot
+genes_to_label <- c("inx-3", "meg-1", "meg-2", "meg-3", "meg-4")
+
+############################
+# VOLCANO PLOT FUNCTION
+
+# make plot and label the genes of interest. is flexible on including enhancer genes
+make_volcano <- function(res_df, timepoint_label, promoter_genes, enhancer_genes = NULL,
+                         include_enhancer = FALSE, outPath = NULL, genes_to_label) {
+# order by p-value ascending
+  res_df <- res_df[order(res_df$pvalue, decreasing = TRUE), ]
+
+  if (include_enhancer && !is.null(enhancer_genes)) {
+
+    # SET 2: PROMOTER / ENHANCER / OVERLAP / DE / NS
+    res_df$color <- case_when(
+      res_df$SYMBOL %in% promoter_genes & res_df$SYMBOL %in% enhancer_genes ~ "royalblue",
+      res_df$SYMBOL %in% promoter_genes                                      ~ "mediumpurple3",
+      res_df$SYMBOL %in% enhancer_genes                                      ~ "forestgreen",
+      abs(res_df$log2FoldChange) > 0.5 | res_df$pvalue < 0.0001             ~ "darkorange",
+      TRUE                                                                    ~ "grey40"
+    )
+
+    color_order <- c("grey40", "darkorange", "forestgreen", "mediumpurple3", "royalblue")
+    res_df <- res_df[order(factor(res_df$color, levels = color_order)), ]
+
+    keyvals <- res_df$color
+    names(keyvals)[keyvals == "royalblue"]     <- "Promoter and enhancer associated DEG"
+    names(keyvals)[keyvals == "mediumpurple3"] <- "ChIPseeker promoter-associated DEG"
+    names(keyvals)[keyvals == "forestgreen"]   <- "Enhancer associated"
+    names(keyvals)[keyvals == "darkorange"]    <- "Significant DEG"
+    names(keyvals)[keyvals == "grey40"]        <- "Non-significant"
+
+  } else {
+
+    # SET 1: PROMOTER / DE / NS
+    res_df$color <- case_when(
+      res_df$SYMBOL %in% promoter_genes                                      ~ "mediumpurple3",
+      abs(res_df$log2FoldChange) > 0.5 | res_df$pvalue < 0.0001             ~ "darkorange",
+      TRUE                                                                    ~ "grey40"
+    )
+
+    color_order <- c("grey40", "darkorange", "mediumpurple3")
+    res_df <- res_df[order(factor(res_df$color, levels = color_order)), ]
+
+    keyvals <- res_df$color
+    names(keyvals)[keyvals == "mediumpurple3"] <- "ChIPseeker promoter-associated DEG"
+    names(keyvals)[keyvals == "darkorange"]    <- "Significant DEG"
+    names(keyvals)[keyvals == "grey40"]        <- "Non-significant"
+  }
+
+  # LABEL GENES OF INTEREST REGARDLESS OF CATEGORY
+  suffix <- if (include_enhancer) "_promoter_enhancer" else "_promoter_only"
+
+  volcano <- EnhancedVolcano(res_df,
+    lab             = res_df$SYMBOL,
+    selectLab       = genes_to_label,
+    x               = "log2FoldChange",
+    y               = "pvalue",
+    xlim = c(-15, 18),
+    ylim = c(0, 125),
+    pCutoff         = 0.05,
+    FCcutoff        = 0.5,
+    title           = paste0(timepoint_label, " "),
+    subtitle        = NULL,
+    caption         = NULL,
+    labSize         = 3.5,
+    cutoffLineCol   = "grey40",
+    drawConnectors  = FALSE,
+    widthConnectors = 0.25,
+    colCustom       = keyvals,
+    max.overlaps    = Inf,
+    legendLabSize   = 7,
+    legendIconSize  = 3
+  ) +
+    theme(plot.title        = element_text(hjust = 0.5),
+          legend.position   = "bottom",
+          legend.direction  = "vertical",
+          legend.text       = element_text(size = 7),
+          legend.key.size   = unit(0.4, "cm"),
+          aspect.ratio       = 1)
+  
+  # make border for the outside of genes_to_label points
+  highlight_df <- res_df[res_df$SYMBOL %in% genes_to_label, ]
+
+  volcano <- volcano +
+    geom_point(data = highlight_df,
+              aes(x = log2FoldChange, y = -log10(pvalue)),
+              shape = 21, size = 1, stroke = 0.8,
+              colour = "black", fill = NA)
+
+  # force vertical stacking
+  volcano <- volcano +
+    guides(colour = guide_legend(ncol = 1),
+           color  = guide_legend(ncol = 1))
+  
+  if (!is.null(outPath)) {
+    ggsave(file.path(outPath, paste0(timepoint_label, suffix, "_volcano.pdf")),
+           plot = volcano, width = 6, height = 6, dpi = 300)
+    ggsave(file.path(outPath, paste0(timepoint_label, suffix, "_volcano.png")),
+           plot = volcano, width = 6, height = 6, dpi = 300)
+  }
+
+  return(volcano)
+}
+
+
+
+
+```
+
+
+
+## L1
+
+```{r}
+fpath <- "/projects/daylab/yulia/RNA-Seq/DESeq/DESeq_Results_L1vsRA/"
+resLFC <- read.csv(file.path(fpath, "DESeq2_L1vsRA.csv"))
+colnames(resLFC)[colnames(resLFC) == "X"] <- "SYMBOL"
+resLFC$log2FoldChange <- -resLFC$log2FoldChange
+
+#enhancer.L1_genes <- unique(gsub(" .*$", "", readLines( " ")))
+
+## SET 1: PROMOTER ONLY
+make_volcano(resLFC, "L1",
+             promoter_genes   = promoter_genes.L1,
+             include_enhancer = FALSE,
+             outPath          = outPath,
+             genes_to_label   = genes_to_label)
+
+## SET 2: PROMOTER + ENHANCER
+#make_volcano(resLFC, "L1",
+#             promoter_genes   = promoter_genes.L1,
+#             enhancer_genes   = enhancer.L1,
+#             include_enhancer = TRUE,
+#             outPath          = outPath)
+```
+
+## RA
+
+```{r}
+
+#enhancer.24hr_genes <- unique(gsub(" .*$", "", readLines( " ")))
+
+## SET 1: PROMOTER ONLY
+make_volcano(resLFC, "RA",
+             promoter_genes   = promoter_genes.RA,
+             include_enhancer = FALSE,
+             outPath          = outPath,
+             genes_to_label   = genes_to_label)
+
+## SET 2: PROMOTER + ENHANCER
+#make_volcano(resLFC, "RA",
+#             promoter_genes   = promoter_genes.RA,
+#             enhancer_genes   = enhancer.RA,
+#             include_enhancer = TRUE,
+#             outPath          = outPath)
+```
+

@@ -1,0 +1,372 @@
+---
+  title: "UV TimeCourse ChIPAnno"
+author: "Julianne (Yulia) Murthy"
+date: "2026-06-01"
+---
+ 
+Goal: this script serves to perform ChIPAnno analysis on CUT&Tag data and RNA-Seq data as an alternative to BETA. To see if there is an association between G4 presence/lack thereof and changes in transcription
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+# INSTALL DEPENDENCIES
+```{r}
+if (!require("BiocManager", quietly = TRUE))
+  install.packages("BiocManager")
+BiocManager::install(version = "3.20")
+
+renv::install(c(
+  "YuLab-SMU/GOSemSim",
+  "YuLab-SMU/DOSE",
+  "YuLab-SMU/ggtree",
+  "YuLab-SMU/clusterProfiler",
+  "GuangchuangYu/enrichplot@devel",
+  "bioc::ChIPseeker",
+  "bioc::org.Hs.eg.db",
+  "bioc::TxDb.Celegans.UCSC.ce11.refGene"
+))
+
+renv::install(c("ggplot2", "dplyr"))
+
+renv::install("bioc::org.Hs.eg.db")
+
+renv::snapshot()
+```
+
+
+# LOAD LIBRARIES
+```{r}
+library(ChIPseeker)
+library(ChIPpeakAnno)
+library(TxDb.Hsapiens.UCSC.hg19.knownGene)
+library(org.Hs.eg.db)
+library(GenomicFeatures)
+library(RSQLite)
+library(txdbmaker)
+library(ggplot2)
+library(dplyr)
+```
+
+
+# PATHS
+```{r}
+# TxDb for Homo Sapiens 
+txdb <- TxDb.Hsapiens.UCSC.hg19.knownGene
+transcripts(txdb)
+
+# Prep TxDb filter for protein coding transcripts
+db_conn <- dbconn(txdb)
+
+nm_tx  <- dbReadTable(db_conn, "transcript")
+nm_tx  <- nm_tx[grepl("^NM_", nm_tx$tx_name), ]
+nm_tx <- nm_tx %>% rename(tx_id = X_tx_id)
+nm_ids <- nm_tx$tx_id
+
+splicings_raw <- dbReadTable(db_conn, "splicing") %>% 
+  rename(
+    tx_id   = X_tx_id,
+    exon_id = X_exon_id,
+    cds_id  = X_cds_id
+  )
+genes_raw     <- dbReadTable(db_conn, "gene") %>% rename(tx_id = `X_tx_id`)
+exons_raw <- dbReadTable(db_conn, "exon") %>% rename(exon_id = X_exon_id)
+cds_raw <- dbReadTable(db_conn, "cds") %>% rename(cds_id = X_cds_id)
+
+splicings_full <- splicings_raw %>%
+  left_join(exons_raw[, c("exon_id", "exon_start", "exon_end")], by = "exon_id") %>%
+  left_join(cds_raw[, c("cds_id", "cds_start", "cds_end")],     by = "cds_id")
+
+chrominfo_raw <- dbReadTable(db_conn, "chrominfo")
+chrominfo_raw$is_circular <- as.logical(chrominfo_raw$is_circular)
+
+nm_tx_raw <- as.data.frame(dbReadTable(db_conn, "transcript"))
+
+# Find transcripts that have at least one CDS = protein coding
+coding_tx_ids <- unique(splicings_raw$tx_id[!is.na(splicings_raw$cds_id)])
+
+# Filter by protein coding transcripts
+txdb_coding <- makeTxDb(
+  transcripts = nm_tx_raw %>% filter(X_tx_id %in% coding_tx_ids) %>% rename(tx_id = X_tx_id),
+  splicings   = splicings_full %>% filter(tx_id %in% coding_tx_ids),
+  genes       = genes_raw     %>% filter(tx_id %in% coding_tx_ids),
+  chrominfo   = chrominfo_raw[, c("chrom", "length", "is_circular")]
+)
+
+# Verify to make sure new txdb file is accurate
+length(transcripts(txdb_coding))  
+length(genes(txdb_coding))
+
+# Annotation source check
+columns(org.Hs.eg.db)
+head(keys(org.Hs.eg.db, keytype = "REFSEQ"), 20)
+
+# BED file locations on hpc
+bed_dir <- "/projects/daylab/yulia/ChIPseeker/chipseeker_infiles/Lindsay_UV_ChIPAnno"
+
+# Output directory 
+out_dir <- "/projects/daylab/yulia/ChIPseeker/chipseeker_outfiles/Lindsay_UV_ChIPAnno_updated"
+
+# input filenames - this time using peaks unique to timepoints
+file_01hr <- file.path(bed_dir, "A549_01hr_minus_mock_hq.bed")
+file_24hr <- file.path(bed_dir, "A549_24hr_minus_mock_hq.bed")
+file_48hr <- file.path(bed_dir, "A549_48hr_minus_mock_hq.bed")
+
+# DESEQ SIGNIFICANT results- create 
+deg_01hr <- read.csv(file.path(bed_dir, "RNA_seq_01hr.csv"), row.names=1)
+deg_01hr_sig <- deg_01hr[!is.na(deg_01hr$padj) & deg_01hr$padj < 0.05, ]
+write.csv(deg_01hr_sig, file.path(out_dir, "DEG_sig_01hr.csv"))
+
+deg_24hr <- read.csv(file.path(bed_dir, "RNA_seq_24hr.csv"), row.names=1)
+deg_24hr_sig <- deg_24hr[!is.na(deg_24hr$padj) & deg_24hr$padj < 0.05, ]
+write.csv(deg_24hr_sig, file.path(out_dir, "DEG_sig_24hr.csv"))
+
+deg_48hr <- read.csv(file.path(bed_dir, "RNA_seq_48hr.csv"), row.names=1)
+deg_48hr_sig <- deg_48hr[!is.na(deg_48hr$padj) & deg_48hr$padj < 0.05, ]
+write.csv(deg_48hr_sig, file.path(out_dir, "DEG_sig_48hr.csv"))
+
+
+```
+
+
+# READ IN PEAK FILES
+```{r}
+peak01hr <- readPeakFile(file_01hr)
+peak24hr <- readPeakFile(file_24hr)
+peak48hr <- readPeakFile(file_48hr)
+
+cat("01hr peaks:  ", length(peak01hr), "\n") #6361
+cat("24hr peaks:", length(peak24hr), "\n") #1387
+cat("48hr peaks:", length(peak48hr), "\n") #2452
+
+```
+
+
+# ANNOTATE PEAKS
+## For homo sapiens we are doing 3kb for promoter
+```{r}
+# Extract transcripts and gene feature
+annoData <- toGRanges(txdb, feature = "gene")
+
+# 01hr ChipAnno peaks, with flanking genes added as well
+peakAnno01hr <- annotatePeakInBatch(
+  peak01hr,
+  AnnotationData      = annoData,
+  output              = "both",
+  maxgap              = 3000,
+  PeakLocForDistance  = "endMinusStart",
+  FeatureLocForDistance = "TSS"   
+)
+
+# 24hr ChipAnno peaks, with flanking genes added as well
+peakAnno24hr <- annotatePeakInBatch(
+  peak24hr,
+  AnnotationData      = annoData,
+  output              = "both",
+  maxgap              = 3000,
+  PeakLocForDistance  = "endMinusStart",
+  FeatureLocForDistance = "TSS"
+)
+
+# 48hr ChipAnno peaks, with flanking genes added as well
+peakAnno48hr <- annotatePeakInBatch(
+  peak48hr,
+  AnnotationData      = annoData,
+  output              = "both",
+  maxgap              = 3000,
+  PeakLocForDistance  = "endMinusStart",
+  FeatureLocForDistance = "TSS"
+)
+
+# Add gene symbols and gene descriptions with org.Hs.eg.db
+peakAnno01hr <- addGeneIDs(peakAnno01hr,
+                          orgAnn   = "org.Hs.eg.db",
+                          feature_id_type = "entrez_id",
+                          IDs2Add  = c("symbol","genename"))
+
+peakAnno24hr <- addGeneIDs(peakAnno24hr,
+                          orgAnn   = "org.Hs.eg.db",
+                          feature_id_type = "entrez_id",
+                          IDs2Add  = c("symbol","genename"))
+
+peakAnno48hr <- addGeneIDs(peakAnno48hr,
+                          orgAnn   = "org.Hs.eg.db",
+                          feature_id_type = "entrez_id",
+                          IDs2Add  = c("symbol","genename"))
+
+
+
+```
+
+
+# EXPORT FULL ANNOTATION CSVs
+```{r}
+# Convert to data frames
+df01hr <- as.data.frame(peakAnno01hr)  
+df24hr <- as.data.frame(peakAnno24hr)
+df48hr <- as.data.frame(peakAnno48hr)
+
+# Write full annotation CSVs
+write.csv(df01hr, file = file.path(out_dir, "peakAnno01hr_full.csv"),  row.names = FALSE)
+write.csv(df24hr, file = file.path(out_dir, "peakAnno24hr_full.csv"),  row.names = FALSE)
+write.csv(df48hr, file = file.path(out_dir, "peakAnno48hr_full.csv"),  row.names = FALSE)
+
+```
+
+# QUICK VISUALIZATION
+```{r}
+# Feature pie plots
+png(file.path(out_dir, "Featureplot_UVTimeCourse.png"), width = 10, height = 5,
+    units = "in", res = 300)
+par(mfrow = c(1, 3))
+pie1(table(df01hr$insideFeature), main = "01hr Peak Annotation")
+pie1(table(df24hr$insideFeature), main = "24hr Peak Annotation")
+pie1(table(df48hr$insideFeature), main = "48hr Peak Annotation")
+dev.off()
+
+# TSS binding distance sites
+png(file.path(out_dir, "distToTSS_UVTimeCourse.png"), width = 10, height = 5,
+    units = "in", res = 300)
+par(mfrow = c(1, 3))
+hist(df01hr$distancetoFeature, breaks = 50,
+     main = "01hr Distance to TSS", 
+     xlab = "Distance (bp)", 
+     xlim = c(0,100000),
+      ylim = c(0,5000),
+     col = "aquamarine", 
+     border = "white")
+hist(df24hr$distancetoFeature, breaks = 50,
+     main = "24hr Distance to TSS", 
+     xlab = "Distance (bp)", 
+     xlim = c(0,100000), 
+     ylim = c(0,5000),
+     col = "coral",    
+     border = "white")
+hist(df48hr$distancetoFeature, breaks = 50,
+     main = "48hr Distance to TSS", 
+     xlab = "Distance (bp)", 
+     xlim = c(0,100000), 
+     ylim = c(0,5000),
+     col = "violet",    
+     border = "white")
+dev.off()
+
+```
+
+
+# FILTER FOR PROMOTER PEAKS 
+```{r}
+
+# Bin by promoter distance categories
+bin_peaks <- function(df) {
+  df %>%
+    filter(abs(distancetoFeature) <= 3000) %>%
+    mutate(promoter_bin = case_when(
+      abs(distancetoFeature) <= 1000                                  ~ "Promoter (<=1kb)",
+      abs(distancetoFeature) >  1000 & abs(distancetoFeature) <= 2000 ~ "Promoter (1-2kb)",
+      abs(distancetoFeature) >  2000 & abs(distancetoFeature) <= 3000 ~ "Promoter (2-3kb)"
+    ))
+}
+
+prom01hr <- bin_peaks(df01hr)
+prom24hr <- bin_peaks(df24hr)
+prom48hr <- bin_peaks(df48hr)
+
+print(table(prom01hr$promoter_bin))
+print(table(prom24hr$promoter_bin))
+print(table(prom48hr$promoter_bin))
+
+cat("01hr promoter peaks:  ", nrow(prom01hr), "/", nrow(df01hr), "\n") 
+cat("24hr promoter peaks:", nrow(prom24hr), "/", nrow(df24hr), "\n") 
+cat("48hr promoter peaks:", nrow(prom48hr), "/", nrow(df48hr), "\n") 
+
+```
+
+
+# WRITE THE PROMOTER FILTERED CSVs
+```{r}
+write.csv(prom01hr, file = file.path(out_dir, "peakAnno01hr_promoter.csv"), row.names = FALSE)
+write.csv(prom24hr, file = file.path(out_dir, "peakAnno24hr_promoter.csv"), row.names = FALSE)
+write.csv(prom48hr, file = file.path(out_dir, "peakAnno48hr_promoter.csv"), row.names = FALSE)
+
+```
+
+
+# INNERJOIN SIG DEGs & PROMOTER G4s
+```{r}
+
+# Rename symbol column to match deseq
+prom01hr <- prom01hr %>% rename(SYMBOL = symbol)
+prom24hr <- prom24hr %>% rename(SYMBOL = symbol)
+prom48hr <- prom48hr %>% rename(SYMBOL = symbol)
+
+# Flag whether the matched gene was nearest TSS or flanking
+prom01hr <- prom01hr %>%
+  group_by(peak) %>%
+  mutate(association_type = ifelse(abs(distancetoFeature) == min(abs(distancetoFeature)),
+                                   "nearest_TSS", "flanking")) %>%
+  ungroup()
+print(table(prom01hr$association_type))
+
+prom24hr <- prom24hr %>%
+  group_by(peak) %>%
+  mutate(association_type = ifelse(abs(distancetoFeature) == min(abs(distancetoFeature)),
+                                   "nearest_TSS", "flanking")) %>%
+  ungroup()
+print(table(prom24hr$association_type))
+
+prom48hr <- prom48hr %>%
+  group_by(peak) %>%
+  mutate(association_type = ifelse(abs(distancetoFeature) == min(abs(distancetoFeature)),
+                                   "nearest_TSS", "flanking")) %>%
+  ungroup()
+print(table(prom48hr$association_type))
+
+# Use inner_join() function to match G4 peaks within 3kb of the TSS (“promoter” G4s) to differentially expressed gene
+G4_DEG_01hr <- inner_join(prom01hr, deg_01hr_sig, by = "SYMBOL")
+G4_DEG_24hr <- inner_join(prom24hr, deg_24hr_sig, by = "SYMBOL")
+G4_DEG_48hr <- inner_join(prom48hr, deg_48hr_sig, by = "SYMBOL")
+
+# Check how many genes overlapped
+cat("01hr promoter G4s with DE genes:", nrow(G4_DEG_01hr), "\n") # 288
+cat("24hr promoter G4s with DE genes:", nrow(G4_DEG_24hr), "\n")  # 36
+cat("48hr promoter G4s with DE genes:", nrow(G4_DEG_48hr), "\n")  # 19
+
+# Export to CSV
+write.csv(G4_DEG_01hr, file.path(out_dir, "G4_DEG_overlap_01hr.csv"), row.names = FALSE)
+write.csv(G4_DEG_24hr, file.path(out_dir, "G4_DEG_overlap_24hr.csv"), row.names = FALSE)
+write.csv(G4_DEG_48hr, file.path(out_dir, "G4_DEG_overlap_48hr.csv"), row.names = FALSE)
+
+
+write.table(
+  G4_DEG_01hr, 
+  file = file.path(out_dir, "G4_DEG_overlap_01hr.tsv"), 
+  sep = "\t", 
+  row.names = FALSE
+)
+write.table(
+  G4_DEG_24hr, 
+  file = file.path(out_dir, "G4_DEG_overlap_24hr.tsv"), 
+  sep = "\t", 
+  row.names = FALSE
+)
+write.table(
+  G4_DEG_48hr, 
+  file = file.path(out_dir, "G4_DEG_overlap_48hr.tsv"), 
+  sep = "\t", 
+  row.names = FALSE
+)
+
+```
+
+# FURTHER OBSERVATIONS
+```{r}
+# G4 DEG flanking vs nearest TSS proportions
+print(table(G4_DEG_01hr$association_type)) # 17 flanking, 271 nearest TSS
+print(table(G4_DEG_24hr$association_type)) # 1 flanking, 35 nearest TSS
+print(table(G4_DEG_48hr$association_type)) # 19 nearest TSS
+
+```
+
+
+

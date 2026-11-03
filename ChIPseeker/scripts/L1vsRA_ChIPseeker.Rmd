@@ -1,0 +1,212 @@
+---
+  title: "L1vsRA ChIPseeker"
+author: "Julianne (Yulia) Murthy and SM"
+date: "2026-04-20"
+---
+ 
+Goal: this script serves to perform ChIPseeker analysis on CUT&Tag data and RNA-Seq data as an alternative to BETA. To see if there is an association between G4 presence/lack thereof and changes in transcription
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+# INSTALL DEPENDENCIES
+```{r}
+if (!require("BiocManager", quietly = TRUE))
+  install.packages("BiocManager")
+BiocManager::install(version = "3.20")
+
+renv::install(c(
+  "YuLab-SMU/GOSemSim",
+  "YuLab-SMU/DOSE",
+  "YuLab-SMU/ggtree",
+  "YuLab-SMU/clusterProfiler",
+  "GuangchuangYu/enrichplot@devel",
+  "bioc::ChIPseeker",
+  "bioc::org.Ce.eg.db",
+  "bioc::TxDb.Celegans.UCSC.ce11.refGene"
+))
+
+renv::install(c("ggplot2", "dplyr"))
+
+renv::snapshot()
+```
+
+
+# LOAD LIBRARIES
+```{r}
+library(ChIPseeker)
+library(TxDb.Celegans.UCSC.ce11.refGene)
+library(org.Ce.eg.db)
+library(ggplot2)
+library(dplyr)
+library(rlist)
+```
+
+
+# PATHS
+```{r}
+# TxDb for C. elegans 
+txdb <- TxDb.Celegans.UCSC.ce11.refGene
+
+columns(org.Ce.eg.db)
+keytypes(org.Ce.eg.db)
+head(keys(org.Ce.eg.db, keytype = "ENTREZID"), 20)
+
+# BED file locations on hpc
+bed_dir <- "/projects/daylab/yulia/ChIPseeker/chipseeker_infiles/L1vsRA_ChIPseeker"
+
+# Output directory 
+out_dir <- "/projects/daylab/yulia/ChIPseeker/chipseeker_outfiles/L1vsRA_ChIPseeker"
+
+# input filenames
+file_L1 <- file.path(bed_dir, "L1_BG4_HQfinal.bed")
+file_RA <- file.path(bed_dir, "RepAd_BG4_HQfinal.bed")
+
+# DESEQ SIGNIFICANT results
+deseq <- read.csv(file.path(bed_dir, "DESeq2_L1vsRA_significant_genes.csv"))
+
+```
+
+
+# READ IN PEAK FILES
+```{r}
+peakL1 <- readPeakFile(file_L1)
+peakRA <- readPeakFile(file_RA)
+
+cat("L1 peaks:  ", length(peakL1), "\n") #2653
+cat("RA peaks:", length(peakRA), "\n") #6423
+```
+
+
+# ANNOTATE PEAKS
+## For C. elegans it appears +/- 3kb is correct, see Hunt-Newbury et al 2007 and Saito et al 2013; longest promoter studied appears to be ~2700bp
+```{r}
+peakAnnoL1 <- annotatePeak(
+  peakL1,
+  tssRegion = c(-3000, 3000),
+  TxDb      = txdb,
+  annoDb    = "org.Ce.eg.db"
+)
+
+peakAnnoRA <- annotatePeak(
+  peakRA,
+  tssRegion = c(-3000, 3000),
+  TxDb      = txdb,
+  annoDb    = "org.Ce.eg.db"
+)
+```
+
+
+# QUICK VISUALIZATION
+```{r}
+# Feature bar plots
+plotAnnoBar(peakAnnoL1)   + ggtitle("L1 — Peak Annotation")
+plotAnnoBar(peakAnnoRA)   + ggtitle("RA — Peak Annotation")
+
+# TSS binding distance sites
+plotDistToTSS(peakAnnoL1, title = "L1 — Distance to TSS")
+plotDistToTSS(peakAnnoRA, title = "RA — Distance to TSS")
+```
+
+# EXPORT FULL ANNOTATION CSVs
+```{r}
+# Convert to data frames
+dfL1 <- as.data.frame(peakAnnoL1)
+dfRA <- as.data.frame(peakAnnoRA)
+
+# Write full annotation CSVs
+write.csv(dfL1, file = file.path(out_dir, "peakAnnoL1_full.csv"),     row.names = FALSE)
+write.csv(dfRA, file = file.path(out_dir, "peakAnnoRepAd_full.csv"),  row.names = FALSE)
+
+```
+
+
+# FILTER FOR PROMOTER PEAKS (<=1kb, 1-2kb, 2-3kb of TSS)
+```{r}
+# Label;s that ChIPseeker uses
+PROMOTER_LABELS <- c("Promoter (<=1kb)", "Promoter (1-2kb)", "Promoter (2-3kb)")
+
+promL1 <- dfL1 %>%
+  filter(annotation %in% PROMOTER_LABELS)
+
+promRA <- dfRA %>%
+  filter(annotation %in% PROMOTER_LABELS)
+
+cat("L1 promoter peaks:  ", nrow(promL1), "/", nrow(dfL1), "\n") #2197 / 2648
+cat("RA promoter peaks:", nrow(promRA), "/", nrow(dfRA), "\n") #5768 / 6416
+```
+
+
+# WRITE THE PROMOTER FILTERED CSVs
+```{r}
+write.csv(promL1, file = file.path(out_dir, "peakAnnoL1_promoter.csv"),    row.names = FALSE)
+write.csv(promRA, file = file.path(out_dir, "peakAnnoRA_promoter.csv"), row.names = FALSE)
+
+```
+
+
+# COMBINED ANNOTATION BAR PLOT (L1 vs RA side by side)
+```{r}
+
+named_beds <- list("L1" = file_L1, "Reproductive adult" = file_RA)
+peakAnnoList <- lapply(named_beds, annotatePeak,
+                       TxDb       = txdb,
+                       tssRegion  = c(-3000, 3000),
+                       verbose    = FALSE)
+
+png(file.path(out_dir, "annoBar_L1_vs_RA.png"), width = 7, height = 4,
+    units = "in", res = 300)
+plotAnnoBar(peakAnnoList)
+dev.off()
+
+png(file.path(out_dir, "distToTSS_L1_vs_RA.png"), width = 7, height = 4,
+    units = "in", res = 300)
+plotDistToTSS(peakAnnoList, title = "G4 distance to TSS — L1 vs RA")
+dev.off()
+
+```
+
+
+# INNERJOIN SIG DEGs & PROMOTER G4s
+```{r}
+# No header on original deseq file, add in SYMBOL column to join later
+colnames(deseq)[1] <- "SYMBOL"
+
+# Use inner_join() function to match G4 peaks within 3kb of the TSS (“promoter” G4s) to differentially expressed gene
+G4_DEG_L1 <- inner_join(promL1, deseq, by = "SYMBOL") 
+G4_DEG_RA <- inner_join(promRA, deseq, by = "SYMBOL") 
+
+# Check how many genes overlapped
+cat("L1 promoter G4s with DE genes:", nrow(G4_DEG_L1), "\n") #766
+cat("RA promoter G4s with DE genes:", nrow(G4_DEG_RA), "\n")  #2016
+
+# Export to CSV
+write.csv(G4_DEG_L1, file.path(out_dir, "G4_DEG_overlap_L1.csv"),  row.names = FALSE)
+write.csv(G4_DEG_RA, file.path(out_dir, "G4_DEG_overlap_RA.csv"), row.names = FALSE)
+
+```
+
+
+
+```{r}
+
+
+```
+
+
+#
+```{r}
+
+
+```
+
+#
+```{r}
+
+
+```
+
+
+
+
